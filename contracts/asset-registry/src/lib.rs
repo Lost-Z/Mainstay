@@ -266,6 +266,10 @@ pub enum DataKey {
     ActionProposal(u64, u64),
     /// Stores the next proposal ID counter for an asset.
     ActionProposalCounter(u64),
+    /// Maps an original (pre-restore) asset ID to the new asset ID assigned by
+    /// [`AssetRegistry::restore_asset`], so maintenance history keyed by the old
+    /// ID can be re-linked after a restore.
+    RestoreIdMap(u64),
 }
 
 /// Filter criteria for [`AssetRegistry::search_assets`].
@@ -1809,6 +1813,127 @@ impl AssetRegistry {
             (symbol_short!("ADM_AUD"), symbol_short!("INIT_ADM")),
             (admin, env.ledger().timestamp()),
         );
+    }
+
+    /// Admin-gated restore entry point.
+    ///
+    /// Registers an asset on behalf of its original `owner` without requiring the
+    /// owner's signature. Only the contract admin may call this, which lets an
+    /// operator restore a backup without holding every owner's key.
+    ///
+    /// The new asset receives a fresh ID from `ASSET_COUNT`; the mapping from
+    /// `original_asset_id` to that new ID is persisted so off-chain tooling can
+    /// re-link maintenance history via [`Self::get_restored_asset_id`].
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin; must sign this call
+    /// * `asset_type` - The asset type symbol (must be in the allowlist)
+    /// * `metadata` - The asset metadata string
+    /// * `serial_number` - The unique physical serial number
+    /// * `owner` - The original owner to assign to the restored asset
+    /// * `original_asset_id` - The asset ID from the backup being restored
+    ///
+    /// # Returns
+    /// The newly assigned asset ID
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the stored admin
+    /// - [`ContractError::Paused`] if the contract is paused
+    /// - [`ContractError::InvalidAssetType`] if the type is not in the allowlist
+    /// - [`ContractError::DuplicateAsset`] if the serial number is already registered
+    pub fn restore_asset(
+        env: Env,
+        admin: Address,
+        asset_type: Symbol,
+        metadata: String,
+        serial_number: String,
+        owner: Address,
+        original_asset_id: u64,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&asset_type_key(&asset_type))
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, ContractError::InvalidAssetType);
+        }
+
+        require_string_length(&metadata, "metadata", 256);
+        require_string_length(&serial_number, "serial_number", 128);
+
+        // Serial numbers are globally unique; refuse to restore over an existing asset.
+        let serial_key = serial_number_key(&serial_number);
+        if env.storage().persistent().has(&serial_key) {
+            panic_with_error!(&env, ContractError::DuplicateAsset);
+        }
+
+        let asset_id: u64 = env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0) + 1;
+        env.storage().persistent().set(&ASSET_COUNT, &asset_id);
+        extend_persistent_ttl(&env, &ASSET_COUNT);
+
+        let now = env.ledger().timestamp();
+        let asset = Asset {
+            asset_id,
+            asset_type: asset_type.clone(),
+            metadata: metadata.clone(),
+            serial_number: serial_number.clone(),
+            owner: owner.clone(),
+            registered_at: now,
+            metadata_updated_at: now,
+            metadata_version: 0,
+            deprecation_status: DeprecationStatus::Active,
+            is_locked: false,
+            lender: None,
+            loan_id: None,
+            deprecated_at: None,
+            co_owners: Vec::new(&env),
+        };
+
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        extend_persistent_ttl(&env, &asset_key(asset_id));
+
+        env.storage().persistent().set(&serial_key, &asset_id);
+        extend_persistent_ttl(&env, &serial_key);
+
+        // Dedup key is keyed by owner so the same owner cannot register identical metadata twice.
+        let hash: BytesN<32> = env.crypto().sha256(&metadata.to_xdr(&env)).into();
+        let dk = dedup_key(&owner, &asset_type, &hash);
+        env.storage().persistent().set(&dk, &asset_id);
+        extend_persistent_ttl(&env, &dk);
+
+        owner_index_add(&env, &owner, asset_id);
+        type_count_inc(&env, &asset_type);
+        type_assets_add(&env, &asset_type, asset_id);
+
+        // Record the original -> new ID mapping for maintenance history re-linking.
+        let map_key = DataKey::RestoreIdMap(original_asset_id);
+        env.storage().persistent().set(&map_key, &asset_id);
+        extend_persistent_ttl(&env, &map_key);
+
+        env.events().publish(
+            (symbol_short!("RESTORE"), asset_id),
+            (admin, owner, original_asset_id, now),
+        );
+
+        asset_id
+    }
+
+    /// Returns the new asset ID assigned to `original_asset_id` by
+    /// [`Self::restore_asset`], or `None` if that asset was never restored.
+    pub fn get_restored_asset_id(env: Env, original_asset_id: u64) -> Option<u64> {
+        let key = DataKey::RestoreIdMap(original_asset_id);
+        let mapped: Option<u64> = env.storage().persistent().get(&key);
+        if mapped.is_some() {
+            extend_persistent_ttl(&env, &key);
+        }
+        mapped
     }
 
     /// Get the current admin address of the contract.
@@ -10039,5 +10164,100 @@ mod tests {
     #[test]
     fn test_specialization_mismatch_discriminant_matches_lifecycle() {
         assert_eq!(ContractError::SpecializationMismatch as u32, 30);
+    }
+
+    // ---------------------------------------------------------
+    // #1837 / #1838 — admin-gated restore with ID mapping
+    // ---------------------------------------------------------
+
+    #[test]
+    fn test_restore_asset_preserves_owner_and_maps_id() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let original_id: u64 = 42;
+        let new_id = client.restore_asset(
+            &admin,
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Restored Generator"),
+            &String::from_str(&env, "SN-RESTORE-001"),
+            &owner,
+            &original_id,
+        );
+
+        let asset = client.get_asset(&new_id);
+        assert_eq!(asset.owner, owner, "restore must preserve the original owner");
+        assert_eq!(asset.asset_id, new_id);
+        assert_eq!(
+            client.get_restored_asset_id(&original_id),
+            Some(new_id),
+            "original ID must map to the newly assigned ID"
+        );
+        assert_eq!(client.get_restored_asset_id(&9999u64), None);
+    }
+
+    #[test]
+    fn test_restore_asset_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let impostor = Address::generate(&env);
+        let owner = Address::generate(&env);
+        let result = client.try_restore_asset(
+            &impostor,
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Restored Generator"),
+            &String::from_str(&env, "SN-RESTORE-002"),
+            &owner,
+            &1u64,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32
+            ))),
+            "restore must be admin-gated"
+        );
+    }
+
+    #[test]
+    fn test_restore_asset_rejects_unknown_type() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+
+        let owner = Address::generate(&env);
+        let result = client.try_restore_asset(
+            &admin,
+            &symbol_short!("UNKNOWN"),
+            &String::from_str(&env, "Restored Generator"),
+            &String::from_str(&env, "SN-RESTORE-003"),
+            &owner,
+            &1u64,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidAssetType as u32
+            ))),
+            "restore must respect the asset-type allowlist"
+        );
     }
 }
